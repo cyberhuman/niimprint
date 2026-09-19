@@ -100,7 +100,10 @@ class PrinterClient:
         self._transport = transport
         self._packetbuf = bytearray()
 
-    def print_image(self, image: Image, density: int = 3):
+    def print_image(self, image: Image, density: int = 3, task: str = "legacy"):
+        if task == "v4":
+            self._print_image_v4(image, density)
+            return
         self.set_label_density(density)
         self.set_label_type(1)
         self.start_print()
@@ -115,16 +118,80 @@ class PrinterClient:
         while not self.end_print():
             time.sleep(0.1)
 
+    def _print_image_v4(self, image: Image, density: int):
+        """Print task of the 300 dpi models (D11_H, D110_M, B1 Pro, B21 Pro).
+
+        Sequence per niimbluelib's D110MV4PrintTask and iscarelli's
+        niimbot-web-bluetooth (validated on a D11_H). Compared to the legacy task:
+        9-byte PrintStart, one-way PrintStatus instead of PageStart, 13-byte
+        SetPageSize, rows carry their black pixel count and a repeat count, and the
+        printed-page counter must reach 1 before PrintEnd. These printers only start
+        printing after they ack PageEnd, and an early PrintEnd aborts the job
+        (cut-off or blank label).
+        """
+        self.set_label_density(density)
+        self.set_label_type(1)
+        self.start_print_v4(1)
+        self._send(NiimbotPacket(RequestCodeEnum.GET_PRINT_STATUS, b"\x01"))  # one-way
+        time.sleep(0.03)
+        self.set_page_size_v4(image.height, image.width, 1)
+        for pkt in self._encode_image_v4(image):
+            self._send(pkt)
+        self._send(NiimbotPacket(RequestCodeEnum.END_PAGE_PRINT, b"\x01"))
+        # The D11_H parks its PageEnd ack until it receives another packet, and
+        # prints only after acking, so keep polling status until the page counter
+        # reports the page as printed.
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            self._send(NiimbotPacket(RequestCodeEnum.GET_PRINT_STATUS, b"\x01"))
+            time.sleep(0.15)
+            for packet in self._recv():
+                if packet.type == 219:
+                    raise ValueError(f"printer error {packet.data.hex()}")
+                if packet.type == 0xB3 and len(packet.data) >= 4:
+                    page = int.from_bytes(packet.data[:2], "big")
+                    progress, feed = packet.data[2], packet.data[3]
+                    logging.debug(f"page {page} print {progress}% feed {feed}%")
+                    if page >= 1:
+                        self.end_print()
+                        return
+        raise TimeoutError("printer never reported the page as printed")
+
     def _encode_image(self, image: Image):
         img = ImageOps.invert(image.convert("L")).convert("1")
         for y in range(img.height):
-            line_data = [img.getpixel((x, y)) for x in range(img.width)]
-            line_data = "".join("0" if pix == 0 else "1" for pix in line_data)
-            line_data = int(line_data, 2).to_bytes(math.ceil(img.width / 8), "big")
+            line_data = self._encode_row(img, y)
             counts = (0, 0, 0)  # It seems like you can always send zeros
             header = struct.pack(">H3BB", y, *counts, 1)
             pkt = NiimbotPacket(0x85, header + line_data)
             yield pkt
+
+    def _encode_image_v4(self, image: Image):
+        img = ImageOps.invert(image.convert("L")).convert("1")
+        rows = []  # [first row, data or None if blank, repeat count]
+        for y in range(img.height):
+            line_data = self._encode_row(img, y)
+            if not any(line_data):
+                line_data = None
+            if rows and rows[-1][1] == line_data and rows[-1][2] < 200:
+                rows[-1][2] += 1
+            else:
+                rows.append([y, line_data, 1])
+        for y, line_data, repeat in rows:
+            if line_data is None:
+                yield NiimbotPacket(0x84, struct.pack(">HB", y, repeat))
+            else:
+                total = sum(bin(b).count("1") for b in line_data)
+                header = struct.pack(">HBBBB", y, 0, total & 0xFF, total >> 8, repeat)
+                yield NiimbotPacket(0x85, header + line_data)
+
+    @staticmethod
+    def _encode_row(img: Image, y: int) -> bytes:
+        width_bytes = math.ceil(img.width / 8)
+        line_data = [img.getpixel((x, y)) for x in range(img.width)]
+        line_data = "".join("0" if pix == 0 else "1" for pix in line_data)
+        line_data = line_data.ljust(width_bytes * 8, "0")  # MSB-first, pad right
+        return int(line_data, 2).to_bytes(width_bytes, "big")
 
     def _recv(self):
         packets = []
@@ -256,6 +323,11 @@ class PrinterClient:
         packet = self._transceive(RequestCodeEnum.START_PRINT, b"\x01")
         return bool(packet.data[0])
 
+    def start_print_v4(self, pages, speed=1):
+        data = struct.pack(">HBBBBBBB", pages, 0, 0, 0, 0, 0, speed, 0)
+        packet = self._transceive(RequestCodeEnum.START_PRINT, data)
+        return bool(packet.data[0])
+
     def end_print(self):
         packet = self._transceive(RequestCodeEnum.END_PRINT, b"\x01")
         return bool(packet.data[0])
@@ -278,11 +350,16 @@ class PrinterClient:
         )
         return bool(packet.data[0])
 
+    def set_page_size_v4(self, rows, cols, copies=1):
+        data = struct.pack(">HHH", rows, cols, copies) + bytes(7)
+        packet = self._transceive(RequestCodeEnum.SET_DIMENSION, data)
+        return bool(packet.data[0])
+
     def set_quantity(self, n):
         packet = self._transceive(RequestCodeEnum.SET_QUANTITY, struct.pack(">H", n))
         return bool(packet.data[0])
 
     def get_print_status(self):
         packet = self._transceive(RequestCodeEnum.GET_PRINT_STATUS, b"\x01", 16)
-        page, progress1, progress2 = struct.unpack(">HBB", packet.data)
+        page, progress1, progress2 = struct.unpack(">HBB", packet.data[:4])
         return {"page": page, "progress1": progress1, "progress2": progress2}

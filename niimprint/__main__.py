@@ -6,12 +6,22 @@ from PIL import Image
 
 from niimprint import BluetoothTransport, PrinterClient, SerialTransport
 
+# model: (max image width in px, max density, print task)
+MODELS = {
+    "b1": (384, 5, "legacy"),
+    "b18": (384, 3, "legacy"),
+    "b21": (384, 5, "legacy"),
+    "d11": (96, 3, "legacy"),
+    "d110": (96, 3, "legacy"),
+    "d11_h": (144, 5, "v4"),
+}
+
 
 @click.command("print")
 @click.option(
     "-m",
     "--model",
-    type=click.Choice(["b1", "b18", "b21", "d11", "d110"], False),
+    type=click.Choice(list(MODELS), False),
     default="b21",
     show_default=True,
     help="Niimbot printer model",
@@ -73,14 +83,10 @@ def print_cmd(model, conn, addr, density, rotate, image, verbose):
         port = addr if addr is not None else "auto"
         transport = SerialTransport(port=port)
 
-    if model in ("b1", "b18", "b21"):
-        max_width_px = 384
-    if model in ("d11", "d110"):
-        max_width_px = 96
-
-    if model in ("b18", "d11", "d110") and density > 3:
-        logging.warning(f"{model.upper()} only supports density up to 3")
-        density = 3
+    max_width_px, max_density, task = MODELS[model]
+    if density > max_density:
+        logging.warning(f"{model.upper()} only supports density up to {max_density}")
+        density = max_density
 
     image = Image.open(image)
     if rotate != "0":
@@ -89,7 +95,7 @@ def print_cmd(model, conn, addr, density, rotate, image, verbose):
     assert image.width <= max_width_px, f"Image width too big for {model.upper()}"
 
     printer = PrinterClient(transport)
-    printer.print_image(image, density=density)
+    printer.print_image(image, density=density, task=task)
 
 
 if __name__ == "__main__":
