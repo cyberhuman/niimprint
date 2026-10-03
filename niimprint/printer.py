@@ -264,8 +264,9 @@ class PrinterClient:
         serial = data[idx : idx + serial_len].decode()
 
         idx += serial_len
-        total_len, used_len, type_ = struct.unpack(">HHB", data[idx:])
-        return {
+        total_len, used_len, type_ = struct.unpack(">HHB", data[idx : idx + 5])
+        idx += 5
+        info = {
             "uuid": uuid,
             "barcode": barcode,
             "serial": serial,
@@ -273,6 +274,9 @@ class PrinterClient:
             "total_len": total_len,
             "type": type_,
         }
+        if len(data) >= idx + 2:  # newer firmware (e.g. B1) appends the roll capacity
+            info["capacity"] = struct.unpack(">H", data[idx : idx + 2])[0]
+        return info
 
     def heartbeat(self):
         packet = self._transceive(RequestCodeEnum.HEARTBEAT, b"\x01")
