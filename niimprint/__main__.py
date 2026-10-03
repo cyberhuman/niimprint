@@ -8,7 +8,7 @@ from niimprint import BluetoothTransport, PrinterClient, SerialTransport
 
 # model: (max image width in px, max density, print task)
 MODELS = {
-    "b1": (384, 5, "legacy"),
+    "b1": (384, 5, "b1"),
     "b18": (384, 3, "legacy"),
     "b21": (384, 5, "legacy"),
     "d11": (96, 3, "legacy"),

@@ -101,8 +101,8 @@ class PrinterClient:
         self._packetbuf = bytearray()
 
     def print_image(self, image: Image, density: int = 3, task: str = "legacy"):
-        if task == "v4":
-            self._print_image_v4(image, density)
+        if task in ("v4", "b1"):
+            self._print_image_polled(image, density, task)
             return
         self.set_label_density(density)
         self.set_label_type(1)
@@ -118,29 +118,43 @@ class PrinterClient:
         while not self.end_print():
             time.sleep(0.1)
 
-    def _print_image_v4(self, image: Image, density: int):
-        """Print task of the 300 dpi models (D11_H, D110_M, B1 Pro, B21 Pro).
+    def _print_image_polled(self, image: Image, density: int, task: str):
+        """Print tasks that need the printed-page counter polled before PrintEnd.
 
-        Sequence per niimbluelib's D110MV4PrintTask and iscarelli's
-        niimbot-web-bluetooth (validated on a D11_H). Compared to the legacy task:
-        9-byte PrintStart, one-way PrintStatus instead of PageStart, 13-byte
-        SetPageSize, rows carry their black pixel count and a repeat count, and the
-        printed-page counter must reach 1 before PrintEnd. These printers only start
-        printing after they ack PageEnd, and an early PrintEnd aborts the job
-        (cut-off or blank label).
+        "v4": the 300 dpi models (D11_H, D110_M, B1 Pro, B21 Pro), per
+        niimbluelib's D110MV4PrintTask: 9-byte PrintStart, one-way PrintStatus
+        instead of PageStart, 13-byte SetPageSize.
+        "b1": the protocol-3 B1 line, per iscarelli/niimbot-web-bluetooth
+        (docs/protocol-v4.md): the app's connect handshake first, 7-byte
+        PrintStart, PageStart, 6-byte SetPageSize, rows paced at ~10 ms.
+
+        Both: rows carry their black pixel count and a repeat count, blank rows
+        go as PrintEmptyRow, and PrintEnd is only sent once the printer reports
+        the page as printed. These printers start printing after they ack
+        PageEnd; the legacy task's PrintEnd 0.3 s later aborts the job and the
+        label comes out blank or cut off.
         """
+        if task == "b1":
+            self._handshake_b1()
         self.set_label_density(density)
         self.set_label_type(1)
-        self.start_print_v4(1)
-        self._send(NiimbotPacket(RequestCodeEnum.GET_PRINT_STATUS, b"\x01"))  # one-way
-        time.sleep(0.03)
-        self.set_page_size_v4(image.height, image.width, 1)
+        if task == "v4":
+            self.start_print_v4(1)
+            status = NiimbotPacket(RequestCodeEnum.GET_PRINT_STATUS, b"\x01")
+            self._send(status)  # one-way, no reply awaited
+            time.sleep(0.03)
+            self.set_page_size_v4(image.height, image.width, 1)
+        else:
+            self.start_print_b1(1)
+            self.start_page_print()
+            self.set_page_size_b1(image.height, image.width, 1)
         for pkt in self._encode_image_v4(image):
             self._send(pkt)
+            if task == "b1":
+                time.sleep(0.01)  # the B1 drops rows on an unpaced burst
         self._send(NiimbotPacket(RequestCodeEnum.END_PAGE_PRINT, b"\x01"))
-        # The D11_H parks its PageEnd ack until it receives another packet, and
-        # prints only after acking, so keep polling status until the page counter
-        # reports the page as printed.
+        # Some printers (D11_H) park the PageEnd ack until they receive another
+        # packet, so keep polling status until the page counter reports the page.
         deadline = time.monotonic() + 25
         while time.monotonic() < deadline:
             self._send(NiimbotPacket(RequestCodeEnum.GET_PRINT_STATUS, b"\x01"))
@@ -156,6 +170,23 @@ class PrinterClient:
                         self.end_print()
                         return
         raise TimeoutError("printer never reported the page as printed")
+
+    def _handshake_b1(self):
+        # Without the app's connect sequence a protocol-3 B1 acks every command
+        # but never prints (iscarelli/niimbot-web-bluetooth, "b1 post-connect
+        # handshake"). Replies that are not supported are ignored.
+        for reqcode, data, respoffset in (
+            (0xA5, b"\x01", 16),  # PrinterStatusData -> 0xB5
+            *(
+                (RequestCodeEnum.GET_INFO, bytes((k,)), k)
+                for k in (8, 11, 13, 10, 7, 3, 12, 9)
+            ),
+            (RequestCodeEnum.HEARTBEAT, b"\x04", -3),  # Advanced2 -> 0xD9
+        ):
+            try:
+                self._transceive(reqcode, data, respoffset)
+            except NotImplementedError:
+                pass
 
     def _encode_image(self, image: Image):
         img = ImageOps.invert(image.convert("L")).convert("1")
@@ -327,6 +358,11 @@ class PrinterClient:
         packet = self._transceive(RequestCodeEnum.START_PRINT, b"\x01")
         return bool(packet.data[0])
 
+    def start_print_b1(self, pages):
+        data = struct.pack(">HBBBBB", pages, 0, 0, 0, 0, 0)
+        packet = self._transceive(RequestCodeEnum.START_PRINT, data)
+        return bool(packet.data[0])
+
     def start_print_v4(self, pages, speed=1):
         data = struct.pack(">HBBBBBBB", pages, 0, 0, 0, 0, 0, speed, 0)
         packet = self._transceive(RequestCodeEnum.START_PRINT, data)
@@ -352,6 +388,11 @@ class PrinterClient:
         packet = self._transceive(
             RequestCodeEnum.SET_DIMENSION, struct.pack(">HH", w, h)
         )
+        return bool(packet.data[0])
+
+    def set_page_size_b1(self, rows, cols, copies=1):
+        data = struct.pack(">HHH", rows, cols, copies)
+        packet = self._transceive(RequestCodeEnum.SET_DIMENSION, data)
         return bool(packet.data[0])
 
     def set_page_size_v4(self, rows, cols, copies=1):

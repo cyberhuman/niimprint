@@ -49,6 +49,10 @@ As far as we've tested, Niimbot printers have **8 pixels per mm** (~203 dpi) res
 - **D11**: max 96 pixels (almost equal to 15 mm * 8 px/mm = 120)
 - **D11_H**: max 144 pixels &mdash; this model is **300 dpi (11.8 px/mm)**, so a 25x10 mm label is 295x118 px, and the 144 px head covers 12.2 mm of the tape
 
+### B1
+
+A B1 on firmware 15.x (protocol 3) also prints a blank label with the legacy task: it acks everything, feeds, but the early PrintEnd aborts the job. `--model b1` therefore uses the "b1" task from [iscarelli/niimbot-web-bluetooth](https://github.com/iscarelli/niimbot-web-bluetooth): the app's connect handshake, 7-byte PrintStart, PageStart, 6-byte SetPageSize, rows with pixel counts paced at 10 ms, and polling the printed-page counter before PrintEnd.
+
 ### D11_H
 
 The D11_H is not a D11 with a different sticker: it prints at 300 dpi and speaks the newer print task of the 300 dpi models (D110_M, B1 Pro, B21 Pro). Driven with the legacy task it acks everything and then prints a cut-off or blank label, because it only starts printing after acknowledging the page end and the legacy task sends "print end" 0.3 s later. `--model d11_h` selects the newer task: 9-byte start, 13-byte page size, rows with pixel counts and run lengths, and polling the printed-page counter before ending the job. Sequence and geometry follow [niimbluelib](https://github.com/MultiMote/niimbluelib) (`D110MV4PrintTask`) and [iscarelli/niimbot-web-bluetooth](https://github.com/iscarelli/niimbot-web-bluetooth) (`docs/protocol-v4.md`, validated on a D11_H); the printer reports its 144 px head in the type-3 heartbeat reply.
